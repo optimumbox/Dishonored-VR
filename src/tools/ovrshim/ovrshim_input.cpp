@@ -258,7 +258,9 @@ OVRSHIM_FN(shim_CreateActionSpace)(
 }
 
 // ---------------------------------------------------------------- manifest
-// Index controllers. Grip via squeeze pull (analog); menu on a firm left
+// Index controllers. Grip via the grip FORCE SENSOR (squeeze pressure, analog;
+// mode force_sensor, input force) rather than trigger-mode "pull" - the binding an
+// Index player chose in SteamVR's binding UI, now the default. Menu on a firm left
 // trackpad click. Thumbrest is deliberately ABSENT (Index has none) - the
 // mod's stick-click fallback keeps the ammo radial reachable.
 static const char* kBindingsKnuckles = R"JSON({
@@ -275,10 +277,10 @@ static const char* kBindingsKnuckles = R"JSON({
           "inputs": { "pull": { "output": "/actions/gameplay/in/plasmid" } } },
         { "path": "/user/hand/right/input/trigger", "mode": "trigger",
           "inputs": { "pull": { "output": "/actions/gameplay/in/fire" } } },
-        { "path": "/user/hand/left/input/grip", "mode": "trigger",
-          "inputs": { "pull": { "output": "/actions/gameplay/in/grip_l" } } },
-        { "path": "/user/hand/right/input/grip", "mode": "trigger",
-          "inputs": { "pull": { "output": "/actions/gameplay/in/grip_r" } } },
+        { "path": "/user/hand/left/input/grip", "mode": "force_sensor",
+          "inputs": { "force": { "output": "/actions/gameplay/in/grip_l" } } },
+        { "path": "/user/hand/right/input/grip", "mode": "force_sensor",
+          "inputs": { "force": { "output": "/actions/gameplay/in/grip_r" } } },
         { "path": "/user/hand/right/input/a", "mode": "button",
           "inputs": { "click": { "output": "/actions/gameplay/in/btn_a" } } },
         { "path": "/user/hand/right/input/b", "mode": "button",
