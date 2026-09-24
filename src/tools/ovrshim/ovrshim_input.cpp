@@ -24,9 +24,13 @@
 //  UI - that UI is the escape hatch for every gap below.
 //
 //  Pose components: the mod's aim_l/aim_r -> SteamVR "tip", pose_l/pose_r
-//  (grip) -> "handgrip".
+//  (grip) -> "handgrip". EXCEPT Index: the shim rebuilds all four from the
+//  raw device pose (IndexPoseCorrection below), so an Index hand reports the
+//  same grip/aim frames a Quest hand reports under VDXR (where every
+//  per-weapon offset was tuned), whatever SteamVR binding is live.
 // ============================================================================
 #include "ovrshim.h"
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <direct.h>
@@ -37,6 +41,173 @@ extern const char* ShimModuleDir();
 static ActionSetRec* g_theSet = nullptr;
 static std::vector<ActionRec*> g_setActions;
 static bool g_inputReady = false;
+
+// ---------------------------------------------------------------- Index poses
+// Every hand, weapon and aim offset in the mod was tuned on Quest controllers
+// under VDXR, i.e. against Meta's OpenXR grip/aim frames. SteamVR's Index
+// components are not those frames: "handgrip" sits ~5.9 cm and ~6 deg from
+// where a Quest grip pose sits in the same hand, and "tip" is ~4.2 cm from the
+// Quest aim origin. Correcting the frame here, once, carries every per-weapon
+// offset over unchanged (they are all expressed relative to the grip/aim pose).
+//
+// Derivation, from SteamVR's own render-model JSONs: both controllers define
+// "openxr_handmodel", the frame SteamVR aligns its skeletal hand to, so it is
+// the hand-equivalent link between the two devices. Target (Index raw space)
+//   = IndexHandModel * inv(TouchHandModel) * TouchOpenXR{Grip,Aim}
+// (Touch openxr_grip/openxr_aim are identical on Quest 1/2/3/Pro). Index "tip"
+// has the SAME rotation as Index openxr_handmodel, so binding to "tip" and
+// applying the residual inv(tip) * target leaves a rotation of exactly
+// +60 deg pitch for grip and none for aim; SteamVR resolves "tip" itself, so
+// the JSON's Euler-order ambiguity only touches the translation (2.5 mm, the
+// two conventions' midpoint is used). Left/right mirror in X. At runtime the
+// chain is raw * tip * correction, with tip read from SteamVR's render model.
+enum HandPose { HP_NONE = 0, HP_GRIP_L, HP_GRIP_R, HP_AIM_L, HP_AIM_R };
+
+static int HandPoseFromName(const char* n)
+{
+    if (!strcmp(n, "pose_l")) return HP_GRIP_L;
+    if (!strcmp(n, "pose_r")) return HP_GRIP_R;
+    if (!strcmp(n, "aim_l"))  return HP_AIM_L;
+    if (!strcmp(n, "aim_r"))  return HP_AIM_R;
+    return HP_NONE;
+}
+
+// tip -> target, q = x,y,z,w, p in metres (tip frame: +X right, +Y up, -Z out
+// of the tip). Grip: +60 deg about X (sin30, cos30).
+static M34 IndexPoseCorrection(int hp)
+{
+    const float sx = (hp == HP_GRIP_L || hp == HP_AIM_L) ? 1.0f : -1.0f;
+    if (hp == HP_GRIP_L || hp == HP_GRIP_R)
+    {
+        const float q[4] = { 0.5f, 0.0f, 0.0f, 0.8660254f };
+        const float p[3] = { sx * 0.00580f, -0.07116f, 0.08556f };
+        return M34_FromQuatPos(q, p);
+    }
+    const float q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float p[3] = { sx * 0.00580f, -0.04116f, -0.00944f };
+    return M34_FromQuatPos(q, p);
+}
+
+// Personal hold trim, applied to grip AND aim together (so the drawn weapon and
+// the shot stay on one ray), pivoting about the grip point so the hand does not
+// move. Measured on this rig with the arm extended and the fingers OPEN, where
+// an Index controller swings on its strap: the aim ray read 17-25 deg above and
+// 9-13 deg right of the forearm (left hand, two samples). Pitch applies to both
+// hands; the yaw only to the left, the one hand with data. A GRIPPED hand will
+// now read about this much low - the trade the player chose.
+static const float kHoldPitchDeg = -21.0f;      // negative = rotate down
+static const float kHoldYawDegLeft = 11.0f;     // positive = rotate left
+// Wrist roll about the (already trimmed) pointing axis, so the aim direction is
+// unchanged. Positive = counter-clockwise as seen from behind the hand looking
+// down the arm. Tuned in the headset: right 60 overshot to 10 o'clock (the drawn
+// forearm swings ~2x the roll, it sits off this axis), so 30; left 30 -> 20.
+static const float kHoldRollDegLeft = -20.0f;   // clockwise 20
+static const float kHoldRollDegRight = 30.0f;   // counter-clockwise 30
+
+static M34 IndexHoldTrim(int hp)
+{
+    const bool left = (hp == HP_GRIP_L || hp == HP_AIM_L);
+    const float sx = left ? 1.0f : -1.0f;
+    const float pg[3] = { sx * 0.00580f, -0.07116f, 0.08556f }; // grip point, tip frame
+    const float yaw = (left ? kHoldYawDegLeft : 0.0f) * 0.01745329f;
+    const float pit = kHoldPitchDeg * 0.01745329f;
+    const float qy[4] = { 0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f) };
+    const float qx[4] = { sinf(pit * 0.5f), 0.0f, 0.0f, cosf(pit * 0.5f) };
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    const float neg[3] = { -pg[0], -pg[1], -pg[2] };
+    const float rol = (left ? kHoldRollDegLeft : kHoldRollDegRight) * 0.01745329f;
+    const float qz[4] = { 0.0f, 0.0f, sinf(rol * 0.5f), cosf(rol * 0.5f) };
+    const M34 R = M34_Mul(M34_Mul(M34_FromQuatPos(qy, zero), M34_FromQuatPos(qx, zero)),
+                          M34_FromQuatPos(qz, zero));
+    const float id[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    return M34_Mul(M34_Mul(M34_FromQuatPos(id, pg), R), M34_FromQuatPos(id, neg));
+}
+
+// Right-hand SWORD trim: the grip (hand + sword) only - the right aim ray is
+// left alone. Pivots about the grip point in the hold-trimmed tip frame (-Z
+// along the arm, +Y up, so the blade axis is about +Y with the arm straight).
+// Tuned in the headset: blade edge faced 11 o'clock on a ceiling clock (12 =
+// straight ahead) -> turn it 30 deg right; the tip leaned forward off straight
+// up -> tilt it back a little toward the player.
+static const float kSwordTurnRightDeg = 30.0f;  // about the blade axis
+static const float kSwordTiltBackDeg = 8.0f;    // tip toward the player
+
+static M34 IndexSwordTrim(int hp)
+{
+    const float id[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    if (hp != HP_GRIP_R) return M34_FromQuatPos(id, zero);
+    const float pg[3] = { -0.00580f, -0.07116f, 0.08556f };     // right grip point, tip frame
+    const float neg[3] = { -pg[0], -pg[1], -pg[2] };
+    const float yaw = -kSwordTurnRightDeg * 0.01745329f;        // +Y rotation turns left
+    const float tlt = kSwordTiltBackDeg * 0.01745329f;          // +X rotation tips +Y toward +Z (back)
+    const float qy[4] = { 0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f) };
+    const float qx[4] = { sinf(tlt * 0.5f), 0.0f, 0.0f, cosf(tlt * 0.5f) };
+    const M34 R = M34_Mul(M34_FromQuatPos(qx, zero), M34_FromQuatPos(qy, zero));
+    return M34_Mul(M34_Mul(M34_FromQuatPos(id, pg), R), M34_FromQuatPos(id, neg));
+}
+
+// SteamVR's "tip" transform in the controller's raw space, from the render
+// model itself so SteamVR's own Euler convention applies. The fallback is the
+// same component read from valve_controller_knu_1_0_{left,right}.json (the two
+// Euler readings of it differ by 3.4 deg, so the live query is preferred).
+static M34 IndexTipFallback(int hp)
+{
+    const float s = (hp == HP_GRIP_L || hp == HP_AIM_L) ? 1.0f : -1.0f;
+    const float q[4] = { -0.341695f, s * -0.040989f, s * 0.014919f, 0.938798f };
+    const float p[3] = { s * 0.006f, -0.015f, 0.020f };
+    return M34_FromQuatPos(q, p);
+}
+
+// True when the device behind a pose action's current origin is an Index
+// controller. Cached per action by origin handle; logged once per change.
+// Also resolves the device index and its raw -> tip transform, because the
+// correction is built from the RAW device pose, never from the bound pose
+// component: SteamVR can keep an autosaved binding from an older shim (it did,
+// with grip on "handgrip") and reports no component name to tell them apart.
+static bool OriginIsIndex(ActionRec* a, uint64_t origin)
+{
+    if (!origin) return false;
+    if (origin == a->lastOrigin) return a->lastOriginIsIndex;
+    a->lastOrigin = origin;
+    a->lastOriginIsIndex = false;
+
+    vr::InputOriginInfo_t info = {};
+    if (g_vr.input->GetOriginTrackedDeviceInfo(origin, (InputOriginInfo_t*)&info,
+            sizeof(info)) != EVRInputError_VRInputError_None)
+        return false;
+    char type[64] = {};
+    ETrackedPropertyError perr = ETrackedPropertyError_TrackedProp_Success;
+    g_vr.sys->GetStringTrackedDeviceProperty(info.trackedDeviceIndex,
+        ETrackedDeviceProperty_Prop_ControllerType_String, type, sizeof(type), &perr);
+    if (perr != ETrackedPropertyError_TrackedProp_Success || strcmp(type, "knuckles"))
+    {
+        SLOG("input: %s bound to device %u type='%s' -> Index pose correction off",
+             a->name, info.trackedDeviceIndex, type);
+        return false;
+    }
+    a->deviceIndex = info.trackedDeviceIndex;
+
+    char model[128] = {};
+    g_vr.sys->GetStringTrackedDeviceProperty(info.trackedDeviceIndex,
+        ETrackedDeviceProperty_Prop_RenderModelName_String, model, sizeof(model), &perr);
+    vr::RenderModel_ControllerMode_State_t mode = {};
+    vr::RenderModel_ComponentState_t cs = {};
+    const bool live = g_vr.rm && model[0] &&
+        g_vr.rm->GetComponentStateForDevicePath(model, (char*)"tip", info.devicePath,
+            (RenderModel_ControllerMode_State_t*)&mode, (RenderModel_ComponentState_t*)&cs);
+    a->rawToTip = live ? M34_FromVr(cs.mTrackingToComponentLocal)
+                       : IndexTipFallback(a->handPose);
+    a->lastOriginIsIndex = true;
+
+    float q[4], p[3];
+    M34_ToQuatPos(a->rawToTip, q, p);
+    SLOG("input: %s bound to device %u type='knuckles' model='%s' -> Index pose "
+         "correction ON, raw->tip from %s: q=(%.4f %.4f %.4f %.4f) p=(%.4f %.4f %.4f)",
+         a->name, info.trackedDeviceIndex, model, live ? "SteamVR" : "built-in fallback",
+         q[0], q[1], q[2], q[3], p[0], p[1], p[2]);
+    return true;
+}
 
 // ---------------------------------------------------------------- creation
 OVRSHIM_FN(shim_CreateActionSet)(
@@ -59,6 +230,7 @@ OVRSHIM_FN(shim_CreateAction)(
     a->set = (ActionSetRec*)set;
     strncpy_s(a->name, info->actionName, _TRUNCATE);
     a->type = info->actionType;
+    a->handPose = HandPoseFromName(a->name);
     g_setActions.push_back(a);
     *out = (XrAction)a;
     return XR_SUCCESS;
@@ -589,6 +761,16 @@ static bool SpacePoseInOrigin(SpaceRec* s, M34* out)
         if (ie != EVRInputError_VRInputError_None || !pd.bActive || !pd.pose.bPoseIsValid)
             return false;
         *out = M34_Mul(g_st.originInv, M34_FromVr(pd.pose.mDeviceToAbsoluteTracking));
+        // Index: rebuild from the raw device pose (same WaitGetPoses
+        // prediction as the action read), whatever component is bound.
+        M34 raw;
+        if (s->action->handPose && OriginIsIndex(s->action, pd.activeOrigin) &&
+            Shim_RenderPose(s->action->deviceIndex, &raw))
+            *out = M34_Mul(g_st.originInv,
+                M34_Mul(M34_Mul(M34_Mul(M34_Mul(raw, s->action->rawToTip),
+                                        IndexHoldTrim(s->action->handPose)),
+                                IndexSwordTrim(s->action->handPose)),
+                        IndexPoseCorrection(s->action->handPose)));
         return true;
     }
     }

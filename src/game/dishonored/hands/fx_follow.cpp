@@ -381,6 +381,10 @@ static void FxFollowTickBody()
         for (int i = 0; i < g_waCompN; ++i)
             if (g_waComp[i].ok && g_waComp[i].isMember && g_waComp[i].hand >= 0 && g_waComp[i].hand <= 1) held[g_waComp[i].hand] = true;
         ReleaseSRWLockShared(&g_waCompLock);
+        // Personal build: the empty left hand (powers, Blink, the Heart) is re-posed in the
+        // palm draw, so its aim ray is lifted to match; the pistol and crossbow keep theirs.
+        // 23 deg measured in the headset: the Blink dot sat that far below the fingers.
+        dvr::vr::input_set_aim_pitch_extra(0, held[0] ? 0.0f : 23.0f);
         for (int h = 0; h < 2; ++h)
             if (held[h] != g_mpItemInHand[h]) {
                 g_mpItemInHand[h] = held[h];
